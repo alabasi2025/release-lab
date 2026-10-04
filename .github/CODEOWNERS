@@ -1,0 +1,9 @@
+# Owner review required before merge — narrow scope on what decides CI and
+# what ships (hermes-agent model). Enforced by branch protection.
+/.github/              @alabasi2025
+/pending/workflows/    @alabasi2025
+/scripts/ci/           @alabasi2025
+/scripts/releases/     @alabasi2025
+/scripts/build.mjs     @alabasi2025
+/AGENTS.md             @alabasi2025
+/package.json          @alabasi2025

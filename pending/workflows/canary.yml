@@ -1,0 +1,92 @@
+name: Canary
+
+# Daily canary from main (hermes-agent model, simplified for the lab).
+# Identity: v<published>+canary.<YYYYMMDDTHHMMSSZ> — SemVer-equal to the
+# stable core; the timestamp orders canaries. Builds and publishes a GitHub
+# *prerelease*; stable consumers never see it. Canaries older than 14 days are
+# pruned. If main has no new commit since the last canary, the run is a no-op.
+
+on:
+  schedule:
+    - cron: "41 6 * * *" # daily 06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canary
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  canary:
+    name: Build and publish today's canary
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Decide whether main moved since the last canary
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          last="$(git tag -l 'v*+canary.*' --sort=-creatordate | head -1 || true)"
+          head="$(git rev-parse HEAD)"
+          if [ -n "$last" ] && [ "$(git rev-parse "$last^{commit}")" = "$head" ]; then
+            echo "no new commits since $last"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          published="$(git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 | sed 's/^v//')"
+          [ -n "$published" ] || published="0.0.0"
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "version=$published" >> "$GITHUB_OUTPUT"
+          echo "tag=v$published+canary.$stamp" >> "$GITHUB_OUTPUT"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+      - name: Build
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.decide.outputs.version }}
+          RELEASE_SOURCE_SHA: ${{ github.sha }}
+          RELEASE_CLAIM_TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          npm run build
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C dist -czf "release-lab-canary-${{ steps.decide.outputs.stamp }}.tar.gz" .
+          sha256sum release-lab-canary-*.tar.gz > release-lab-canary.sha256
+      - name: Tag and publish as prerelease
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "canary $TAG from $(git rev-parse --short HEAD)"
+          git push origin "refs/tags/$TAG"
+          gh release create "$TAG" release-lab-canary-*.tar.gz release-lab-canary.sha256 \
+            --prerelease --title "canary $TAG" \
+            --notes "Automatic canary from \`main\` @ $(git rev-parse --short HEAD). Not a stable release."
+      - name: Prune canaries older than 14 days
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '14 days ago' +%s)"
+          for t in $(git tag -l 'v*+canary.*'); do
+            when="$(git log -1 --format=%ct "$t^{commit}")"
+            if (( when < cutoff )); then
+              echo "pruning $t"
+              gh release delete "$t" --yes --cleanup-tag || git push origin ":refs/tags/$t" || true
+            fi
+          done

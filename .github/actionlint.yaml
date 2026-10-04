@@ -1,0 +1,3 @@
+# No self-hosted runners in this lab; everything runs on GitHub-hosted ubuntu-24.04.
+self-hosted-runner:
+  labels: []

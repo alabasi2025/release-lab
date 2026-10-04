@@ -1,0 +1,18 @@
+{
+  "name": "release-lab",
+  "version": "0.0.0",
+  "description": "Hermes-style release pipeline lab. The committed version is always 0.0.0; release jobs stamp the real version from the admitted claim tag.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test app/*.test.mjs",
+    "test:releases": "node --test scripts/releases/*.test.mjs scripts/ci/*.test.mjs",
+    "test:all": "npm run test && npm run test:releases",
+    "lint": "node scripts/ci/lint.mjs",
+    "release": "node scripts/releases/release.mjs",
+    "ci:gate": "node scripts/ci/required-results.mjs"
+  },
+  "license": "MIT"
+}
