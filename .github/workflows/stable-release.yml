@@ -1,0 +1,204 @@
+name: Stable Release
+run-name: Stable release ${{ inputs.tag }}
+
+# The release gate (hermes-agent model). Dispatched BY `release cut` on the
+# exact attempt ref; tags are never triggers. A green run is not a release:
+# `release publish` creates the receipt tag vX.Y.Z afterwards, binding this
+# run, the attempt ref, its object SHA and the commit.
+#
+#   admit ─┬─ ci (strict, reusable)
+#          ├─ build ── verify ── draft
+#          └─ (gate) ── acceptance
+#
+# Secrets: none in this lab. When signing is added, give ONLY the signing job
+# `environment: release-signing` and keep `ci` secret-free.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact attempt ref (rc.<N>-vX.Y.Z), matching the selected workflow ref
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  admit:
+    name: Admit the claim
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.admit.outputs.tag }}
+      claim-object: ${{ steps.admit.outputs.claim-object }}
+      commit: ${{ steps.admit.outputs.commit }}
+      version: ${{ steps.admit.outputs.version }}
+      attempt: ${{ steps.admit.outputs.attempt }}
+      epoch: ${{ steps.admit.outputs.epoch }}
+      skip-tests: ${{ steps.admit.outputs.skip-tests }}
+    steps:
+      - name: The dispatched ref must be the claimed tag
+        env:
+          REF: ${{ github.ref }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          [ "$REF" = "refs/tags/$TAG" ] || { echo "::error::dispatched on $REF but tag input is $TAG — dispatch on the tag itself"; exit 1; }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: admit
+        run: node scripts/releases/release.mjs admit --tag "${{ inputs.tag }}" --checked-out "${{ github.sha }}"
+
+  ci:
+    name: Source CI (strict)
+    needs: admit
+    if: needs.admit.outputs.skip-tests != 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      release: true
+    # Deliberately NO `secrets: inherit`: ci runs PR-grade code paths.
+
+  build:
+    name: Build and stamp
+    needs: admit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.admit.outputs.commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Build from the admitted commit with the derived version
+        env:
+          RELEASE_VERSION: ${{ needs.admit.outputs.version }}
+          RELEASE_SOURCE_SHA: ${{ needs.admit.outputs.commit }}
+          RELEASE_CLAIM_TAG: ${{ needs.admit.outputs.tag }}
+        run: npm run build
+      - name: Package (deterministic tar, sorted, fixed mtime)
+        env:
+          EPOCH: ${{ needs.admit.outputs.epoch }}
+          VERSION: ${{ needs.admit.outputs.version }}
+        run: |
+          set -euo pipefail
+          mtime="$(date -u -d "${EPOCH:0:4}-${EPOCH:4:2}-${EPOCH:6:2} ${EPOCH:9:2}:${EPOCH:11:2}:${EPOCH:13:2}" +%s)"
+          tar --sort=name --mtime="@$mtime" --owner=0 --group=0 --numeric-owner \
+              -C dist -cf "release-lab-$VERSION.tar" .
+          gzip -n -9 "release-lab-$VERSION.tar"
+          sha256sum "release-lab-$VERSION.tar.gz" > "release-lab-$VERSION.tar.gz.sha256"
+          cat "release-lab-$VERSION.tar.gz.sha256"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-lab-${{ needs.admit.outputs.version }}
+          path: |
+            release-lab-*.tar.gz
+            release-lab-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  verify:
+    name: Verify the packaged bytes
+    needs: [admit, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-lab-${{ needs.admit.outputs.version }}
+      - name: Checksum, extract, run, assert stamped identity
+        env:
+          VERSION: ${{ needs.admit.outputs.version }}
+          COMMIT: ${{ needs.admit.outputs.commit }}
+          TAG: ${{ needs.admit.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sha256sum -c "release-lab-$VERSION.tar.gz.sha256"
+          mkdir out && tar -xzf "release-lab-$VERSION.tar.gz" -C out
+          node -e '
+            const m = require("./out/manifest.json");
+            const s = require("./out/app/stamp.json");
+            const { createHash } = require("crypto"); const fs = require("fs");
+            if (m.version !== process.env.VERSION || s.version !== process.env.VERSION) throw new Error("version drift");
+            if (s.sourceGitSha !== process.env.COMMIT) throw new Error("commit drift");
+            if (s.claimTag !== process.env.TAG) throw new Error("claim drift");
+            for (const f of m.files) {
+              const h = createHash("sha256").update(fs.readFileSync("out/" + f.path)).digest("hex");
+              if (h !== f.sha256) throw new Error("hash drift: " + f.path);
+            }
+            console.log("verified", m.files.length, "files for", s.version, "@", s.sourceGitSha.slice(0,7));
+          '
+          out="$(node out/app/index.mjs release)"
+          echo "$out"; [[ "$out" == *"release-lab $VERSION"* ]]
+
+  draft:
+    name: Draft GitHub release on the attempt ref
+    needs: [admit, build, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.admit.outputs.commit }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-lab-${{ needs.admit.outputs.version }}
+      - name: Create or update the draft (never published here)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.admit.outputs.tag }}
+          VERSION: ${{ needs.admit.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo '> **Do not publish this release from the GitHub UI.** `release publish --version '"$VERSION"'` creates the receipt tag, retargets this draft onto it, and publishes. A hand-published release skips the receipt and blocks the pipeline.'
+            echo
+            echo "Attempt: \`$TAG\` · Run: $RUN_URL"
+            echo
+            git for-each-ref --format='%(contents)' "refs/tags/$TAG" | sed 's/^/    /'
+          } > body.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-lab-*.tar.gz release-lab-*.tar.gz.sha256 --clobber
+            gh release edit "$TAG" --draft --notes-file body.md
+          else
+            gh release create "$TAG" release-lab-*.tar.gz release-lab-*.tar.gz.sha256 \
+              --draft --title "v$VERSION (attempt $TAG)" --notes-file body.md
+          fi
+
+  acceptance:
+    # The one join. `release publish` reads this run's conclusion; nothing
+    # below `acceptance` may be green while a required job is not.
+    name: Acceptance
+    needs: [admit, ci, build, verify, draft]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+          SKIP_TESTS: ${{ needs.admit.outputs.skip-tests }}
+        run: |
+          # A claim cut with --skip-tests REQUIRES ci to be skipped; any other
+          # skip is a failure. Mirrors hermes-agent's SKIPPED_BY contract.
+          args=(--release)
+          if [ "$SKIP_TESTS" = "true" ]; then args+=(--optional ci); fi
+          printf '%s' "$NEEDS" | node scripts/ci/required-results.mjs "${args[@]}"
