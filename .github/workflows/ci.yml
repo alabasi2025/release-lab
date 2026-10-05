@@ -1,0 +1,134 @@
+name: CI
+
+# Layer 1: the automatic quality gate. Runs on every pull request and every
+# push to main, on GitHub-hosted runners. One aggregate job —
+# `all-checks-pass` — is the only status check branch protection requires.
+#
+# SECURITY: this workflow runs pull-request-controlled code. It must never
+# receive deployment secrets or `secrets: inherit`. Release signing lives in
+# stable-release.yml behind a protected environment.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      release:
+        description: Strict mode for a release candidate — every lane must run and succeed; a skipped required lane fails.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs: a newer push supersedes the previous run. main/dispatch/call: never cancel —
+  # a release may be bound to that exact run.
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  history_check:
+    # Rejects a pull request whose branch has no common ancestor with main.
+    # GitHub's merge UI accepts unrelated histories; such a merge grafts a
+    # second root and collapses `git blame`. (hermes-agent, PR #25045.)
+    name: History check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          filter: tree:0
+      - name: Require a merge-base with the base branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --filter=tree:0 origin "$BASE_REF"
+          if ! base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"; then
+            echo "::error::PR head $HEAD_SHA shares no history with $BASE_REF. Recreate the branch from origin/$BASE_REF." >&2
+            exit 1
+          fi
+          echo "merge-base $base"
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" | wc -l)"
+          commits="$(git rev-list --count "$BASE_SHA".."$HEAD_SHA")"
+          echo "commits ahead: $commits, files changed: $changed"
+          if (( changed > 500 )); then echo "::warning::$changed files changed in $commits commit(s); verify this is intentional."; fi
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm run lint
+
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm test
+
+  release_tooling:
+    name: Release tooling tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Git identity for the disposable-remote tests
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          git config --global init.defaultBranch main
+      - run: npm run test:releases
+
+  build:
+    name: Build (0.0.0 placeholder)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - run: npm run build
+      - run: node dist/app/index.mjs ci
+
+  all-checks-pass:
+    # The single required status check. Add new lanes to `needs`; never to the
+    # branch-protection rule.
+    name: All required checks pass
+    needs: [history_check, lint, tests, release_tooling, build]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Evaluate
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RELEASE: ${{ inputs.release }}
+        run: |
+          args=()
+          if [ "$RELEASE" = "true" ]; then args+=(--release --optional history_check); fi
+          printf '%s' "$NEEDS" | node scripts/ci/required-results.mjs "${args[@]}"
