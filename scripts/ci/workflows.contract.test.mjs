@@ -7,12 +7,19 @@ import path from 'node:path';
 import test from 'node:test';
 
 const root = path.resolve(new URL('..', import.meta.url).pathname, '..');
-const dir = existsSync(path.join(root, '.github/workflows/ci.yml'))
-  ? path.join(root, '.github/workflows')
-  : path.join(root, 'pending/workflows');
+// Each workflow is read from .github/workflows/ once installed, else from
+// pending/workflows/. Resolved per file: the three are installed through
+// separate pull requests, so a branch may hold a mix.
+function locate(name) {
+  for (const dir of ['.github/workflows', 'pending/workflows']) {
+    const full = path.join(root, dir, name);
+    if (existsSync(full)) return full;
+  }
+  throw new Error(`workflow ${name} not found in .github/workflows or pending/workflows`);
+}
 // Strip YAML comments so a comment that *mentions* a forbidden construct is not
 // mistaken for the construct itself.
-const read = (name) => readFileSync(path.join(dir, name), 'utf8').replace(/\r\n/g, '\n')
+const read = (name) => readFileSync(locate(name), 'utf8').replace(/\r\n/g, '\n')
   .split('\n').map((line) => line.replace(/^(\s*)#.*$/u, '$1')).join('\n');
 const ci = read('ci.yml');
 const stable = read('stable-release.yml');
